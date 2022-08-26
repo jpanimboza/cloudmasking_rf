@@ -1,0 +1,78 @@
+var AOI = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[-54.47562475599466, -32.2062382270419],
+          [-54.47562475599466, -32.40356176395097],
+          [-54.28611059583841, -32.40356176395097],
+          [-54.28611059583841, -32.2062382270419]]], null, false);
+//Consultas y sugerencias:
+// eve.schibber@gmail.com
+// jonathan.g.ej@gmail.com
+///Corregir atmosféricamente las imágenes Sentinel 2 TOA utilizando el modelo SIAC //https://github.com/MarcYin/SIAC
+// Enmascarar nubes de la colección de imágenes utilizando una clasificación Random Forest
+
+
+
+//Cargar una imagen con nubes y su respectiva imagen de probabilidad de nubes
+var S2_nubes = ee.Image('COPERNICUS/S2/20180212T133221_20180212T133630_T21HYE');
+var S2_nubes_pr = ee.Image('COPERNICUS/S2_CLOUD_PROBABILITY/20180212T133221_20180212T133630_T21HYE');
+
+//Añadir la banda de probabilidad de nubes a la imagen 
+var train_img=S2_nubes.addBands(S2_nubes_pr);
+
+//Crear una banda para las clases no nube (0), y nube (1)
+var cloud_p_c = train_img.addBands(ee.Image(0)
+          .where(train_img.select('probability').gt(50)
+          .and(train_img.select('probability').lte(100)), 1)
+          .rename('cld_id'));
+          
+//Importar la Coleccion Sentinel L1C y aplica filtros
+var S2_TOA = ee.ImageCollection('COPERNICUS/S2')	
+    .filterDate('2018-02-25', '2018-12-01')
+    .filterBounds(AOI)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
+    
+//Corrección atmosférica
+var siac = require('users/marcyinfeng/utils:SIAC'); //https://github.com/MarcYin/SIAC
+//Función para corregir con modelo SIAC
+var boa_siac = function(image){
+  var bandas = image.select(['QA60']);
+   var boa = siac.get_sur(image);
+      boa = boa.multiply(10000).toInt();
+return boa.addBands(bandas).set('system:time_start', image.get('system:time_start')).clip(AOI);
+};
+
+//Corrección de las imágenes sentinel-2 de TOA a BOA
+var S2_BOA = S2_TOA.map(boa_siac);
+
+//Cortar las imágenes de acuerdo al Área de Interés
+S2_BOA= S2_BOA.map(function(img){
+  var x = img.clip(AOI);
+  return x;
+});
+
+//Crear un conjunto de entrenamiento tomando como estratos de muestreo las
+//clases definidas previamente
+var training = cloud_p_c.stratifiedSample({
+  numPoints: 200, 
+  classBand: "cld_id",
+  region:cloud_p_c.geometry(), 
+  scale: 20,
+  geometries: false
+});
+
+//Función de clasificación de nubes con Random Forest 
+//y enmascaramiento de nubes
+function map_RF(img){
+  var bands=['B4','B6','B7','B8','B8A','B11','B12'];
+  var clasRF=ee.Classifier.smileRandomForest(50).train(training,"cld_id",bands);
+  var class_step=img.select(bands).classify(clasRF).rename('RF_cloud');
+  var mask_i=class_step.select('RF_cloud').eq(0);
+  return img.updateMask(mask_i).addBands(class_step);
+}
+
+//Clasificar y enmascarar las imágenes
+var S2_BOA_MASKED=S2_BOA.map(map_RF);
+//Las nubes deberían nostrarse en gris o blanco
+Map.addLayer(S2_TOA.first().select('QA60'),{min:0,max:2048},'Nubes-QA60'); 
+//Nótese la poca utilidad de la banda QA60 para enmascarar nubes
+Map.addLayer(S2_BOA.first(),{bands:['B4','B3','B2'],min:0,max:3000},'S2_BOA');
+Map.addLayer(S2_BOA_MASKED.first(),{bands:['B4','B3','B2'],min:0,max:3000},'S2_BOA_MASKED');
